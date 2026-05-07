@@ -317,3 +317,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+#Other stuff
+.codex
+.idea
+src/
+legacy/
+sbatch_files/
