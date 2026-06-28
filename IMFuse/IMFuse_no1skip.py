@@ -211,6 +211,8 @@ class Decoder_fuse(nn.Module):
         residual_boost=False,
         booster_hidden=16,
         residual_alpha=0.1,
+        subset_size_booster_gate=False,
+        booster_min_gate=0.25,
     ):
         super(Decoder_fuse, self).__init__()
 
@@ -252,7 +254,13 @@ class Decoder_fuse(nn.Module):
         self.use_residual_boost = residual_boost
         self.subset_adapter = SubsetAwareAdapter3D(basic_dims) if subset_adapter else None
         self.residual_booster = (
-            ResidualBooster3D(num_cls, hidden=booster_hidden, init_scale=residual_alpha)
+            ResidualBooster3D(
+                num_cls,
+                hidden=booster_hidden,
+                init_scale=residual_alpha,
+                subset_size_gate=subset_size_booster_gate,
+                min_gate=booster_min_gate,
+            )
             if residual_boost
             else None
         )
@@ -445,6 +453,8 @@ class Model(nn.Module):
         residual_boost=False,
         booster_hidden=16,
         residual_alpha=0.1,
+        subset_size_booster_gate=False,
+        booster_min_gate=0.25,
     ):
         super(Model, self).__init__()
         self.interleaved_tokenization = interleaved_tokenization
@@ -533,6 +543,8 @@ class Model(nn.Module):
             residual_boost=residual_boost,
             booster_hidden=booster_hidden,
             residual_alpha=residual_alpha,
+            subset_size_booster_gate=subset_size_booster_gate,
+            booster_min_gate=booster_min_gate,
         )
         self.decoder_sep = Decoder_sep(num_cls=num_cls)
 

@@ -33,13 +33,13 @@ SUBSET_NAMES = tuple(_subset_name(mask) for mask in SUBSET_MASKS)
 def mask_to_subset_indices(mask):
     mask = mask.bool()
     bits = torch.tensor([8, 4, 2, 1], device=mask.device, dtype=torch.long)
-    codes = torch.matmul(mask.long(), bits)
+    codes = torch.sum(mask.long() * bits.view(1, -1), dim=1)
 
     code_to_index = torch.full((16,), -1, device=mask.device, dtype=torch.long)
     subset_codes = []
     for subset in SUBSET_MASKS:
         subset_tensor = torch.tensor(subset, device=mask.device, dtype=torch.long)
-        subset_codes.append(int(torch.matmul(subset_tensor, bits).item()))
+        subset_codes.append(int(torch.sum(subset_tensor * bits).item()))
     code_to_index[torch.tensor(subset_codes, device=mask.device)] = torch.arange(
         len(SUBSET_MASKS), device=mask.device
     )
@@ -81,6 +81,29 @@ def make_random_superset_mask(mask):
         superset[sample_idx, choice] = True
         valid[sample_idx] = True
     return superset, valid
+
+
+def subset_indices_to_masks(indices, device=None):
+    if device is None:
+        device = indices.device
+    subset_tensor = torch.tensor(SUBSET_MASKS, device=device, dtype=torch.bool)
+    return subset_tensor[indices.long()]
+
+
+def resample_with_weak_subsets(mask, subset_tracker, topk=5, probability=0.5):
+    if subset_tracker is None or probability <= 0:
+        return mask, 0
+    weak = subset_tracker.weak_indices(topk)
+    if weak.numel() == 0:
+        return mask, 0
+    replace = torch.rand(mask.size(0), device=mask.device) < probability
+    replace_count = int(replace.sum().item())
+    if replace_count == 0:
+        return mask, 0
+    chosen = weak[torch.randint(weak.numel(), (replace_count,), device=mask.device)]
+    new_mask = mask.clone().bool()
+    new_mask[replace] = subset_indices_to_masks(chosen, device=mask.device)
+    return new_mask, replace_count
 
 
 class SubsetRiskTracker:

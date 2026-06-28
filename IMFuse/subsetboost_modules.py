@@ -34,10 +34,23 @@ class SubsetAwareAdapter3D(nn.Module):
 
 
 class ResidualBooster3D(nn.Module):
-    def __init__(self, num_cls, hidden=16, max_scale=0.3, init_scale=0.1):
+    def __init__(
+        self,
+        num_cls,
+        hidden=16,
+        max_scale=0.3,
+        init_scale=0.1,
+        subset_size_gate=False,
+        min_gate=0.25,
+    ):
         super().__init__()
         self.max_scale = max_scale
         self.init_scale = init_scale
+        self.register_buffer(
+            "subset_size_gate_flag",
+            torch.tensor(1.0 if subset_size_gate else 0.0, dtype=torch.float32),
+        )
+        self.register_buffer("min_gate_value", torch.tensor(float(min_gate), dtype=torch.float32))
         self.conv1 = nn.Conv3d(num_cls + 1 + 4, hidden, kernel_size=3, padding=1, bias=True)
         self.norm = nn.InstanceNorm3d(hidden, affine=True)
         self.act = nn.LeakyReLU(negative_slope=0.2, inplace=True)
@@ -65,5 +78,12 @@ class ResidualBooster3D(nn.Module):
         x = torch.cat([base_pred, uncertainty, mask_map.to(dtype=base_pred.dtype)], dim=1)
         residual_logits = self.conv2(self.act(self.norm(self.conv1(x))))
         scale = self.max_scale * torch.tanh(self.scale_logit)
+        scale_for_log = scale
+        if self.subset_size_gate_flag.item() > 0.5:
+            subset_size = mask.float().sum(dim=1, keepdim=True).clamp(min=1.0, max=4.0)
+            min_gate = self.min_gate_value.to(device=mask.device, dtype=base_pred.dtype)
+            gate = min_gate + (1.0 - min_gate) * (4.0 - subset_size) / 3.0
+            scale = scale * gate.view(mask.size(0), 1, 1, 1, 1).to(dtype=base_pred.dtype)
+            scale_for_log = scale.detach().mean()
         logits = torch.log(base_pred) + scale * residual_logits
-        return F.softmax(logits, dim=1), scale
+        return F.softmax(logits, dim=1), scale_for_log

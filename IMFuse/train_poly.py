@@ -1,5 +1,6 @@
 #coding=utf-8
 import argparse
+import copy
 import os
 import time
 import logging
@@ -26,6 +27,7 @@ from utils.subsetboost import (
     make_random_superset_mask,
     mask_to_subset_indices,
     per_sample_seg_loss,
+    resample_with_weak_subsets,
     subset_cvar_loss,
 )
 
@@ -64,10 +66,18 @@ parser.add_argument('--subset_adapter', action='store_true', default=False)
 parser.add_argument('--residual_boost', action='store_true', default=False)
 parser.add_argument('--booster_hidden', default=16, type=int)
 parser.add_argument('--residual_alpha', default=0.1, type=float)
+parser.add_argument('--subset_size_booster_gate', action='store_true', default=False)
+parser.add_argument('--booster_min_gate', default=0.25, type=float)
 parser.add_argument('--strong_weak_distill', action='store_true', default=False)
 parser.add_argument('--distill_lambda', default=0.05, type=float)
 parser.add_argument('--distill_conf', default=0.7, type=float)
 parser.add_argument('--distill_interval', default=4, type=int)
+parser.add_argument('--distill_warmup_epoch', default=20, type=int)
+parser.add_argument('--ema_teacher', action='store_true', default=False)
+parser.add_argument('--ema_decay', default=0.999, type=float)
+parser.add_argument('--weak_subset_sampling', action='store_true', default=False)
+parser.add_argument('--weak_sampling_start_epoch', default=50, type=int)
+parser.add_argument('--weak_sampling_prob', default=0.5, type=float)
 parser.add_argument('--val_interval', default=50, type=int)
 path = os.path.dirname(__file__)
 
@@ -109,6 +119,31 @@ def strong_to_weak_distill_loss(student_pred, teacher_pred, confidence=0.7, eps=
     return torch.sum(kl_map * valid) / torch.clamp(torch.sum(valid), min=1.0)
 
 
+def get_fuse_prediction(model_output):
+    if isinstance(model_output, tuple):
+        return model_output[0]
+    return model_output
+
+
+@torch.no_grad()
+def update_ema_model(ema_model, student_model, decay):
+    ema_state = ema_model.state_dict()
+    student_state = student_model.state_dict()
+    for key, ema_value in ema_state.items():
+        student_value = student_state[key]
+        if torch.is_floating_point(ema_value):
+            ema_value.mul_(decay).add_(student_value, alpha=1.0 - decay)
+        else:
+            ema_value.copy_(student_value)
+
+
+def freeze_teacher(teacher):
+    teacher.eval()
+    teacher.module.is_training = False
+    for param in teacher.parameters():
+        param.requires_grad_(False)
+
+
 def main():
     ##########setting seed
     setup_seed(args.seed)
@@ -143,6 +178,9 @@ def main():
             "subset_adapter": args.subset_adapter,
             "residual_boost": args.residual_boost,
             "strong_weak_distill": args.strong_weak_distill,
+            "ema_teacher": args.ema_teacher,
+            "weak_subset_sampling": args.weak_subset_sampling,
+            "subset_size_booster_gate": args.subset_size_booster_gate,
         }
     )
     
@@ -163,6 +201,8 @@ def main():
                     residual_boost=args.residual_boost,
                     booster_hidden=args.booster_hidden,
                     residual_alpha=args.residual_alpha,
+                    subset_size_booster_gate=args.subset_size_booster_gate,
+                    booster_min_gate=args.booster_min_gate,
             )
     else:
         model = Model(
@@ -173,6 +213,8 @@ def main():
                         residual_boost=args.residual_boost,
                         booster_hidden=args.booster_hidden,
                         residual_alpha=args.residual_alpha,
+                        subset_size_booster_gate=args.subset_size_booster_gate,
+                        booster_min_gate=args.booster_min_gate,
                 )
     print (model)
     model = torch.nn.DataParallel(model).cuda()
@@ -232,11 +274,12 @@ def main():
     torch.set_grad_enabled(True)
     logging.info('#############training############')
     # iter_per_epoch = args.iter_per_epoch
-    iter_per_epoch = len(train_loader) #number of batches
+    iter_per_epoch = min(len(train_loader), DEBUG_ITER) if args.debug else len(train_loader) #number of batches
     train_iter = iter(train_loader)
     val_Dice_best = -999999
     start_epoch = 0
     subset_tracker = SubsetRiskTracker(momentum=args.subsetboost_ema, device=torch.device('cuda')) if args.subsetboost else None
+    checkpoint = None
 
     ##########Resume Training
     if args.resume is not None:
@@ -260,12 +303,22 @@ def main():
         if subset_tracker is not None and 'subsetboost_tracker' in checkpoint:
             subset_tracker.load_state_dict(checkpoint['subsetboost_tracker'])
 
+    ema_model = None
+    if args.ema_teacher:
+        ema_model = copy.deepcopy(model)
+        if checkpoint is not None and 'ema_state_dict' in checkpoint:
+            ema_model.load_state_dict(checkpoint['ema_state_dict'], strict=False)
+        freeze_teacher(ema_model)
+        logging.info('EMA self-teacher enabled with decay {}'.format(args.ema_decay))
+
     for epoch in range(start_epoch, args.num_epochs):
         step_lr = lr_schedule(optimizer, epoch)
         # writer.add_scalar('lr', step_lr, global_step=(epoch+1))
         b = time.time()
         model.train()
         model.module.is_training = True
+        if ema_model is not None:
+            freeze_teacher(ema_model)
 
         prm_cross_loss_epoch = 0.0
         prm_dice_loss_epoch = 0.0
@@ -279,6 +332,7 @@ def main():
         subsetboost_weak_epoch = 0.0
         subsetboost_rank_epoch = 0.0
         subsetboost_distill_epoch = 0.0
+        weak_sampling_count_epoch = 0
 
         ########## training epoch
         for i in range(iter_per_epoch):
@@ -293,6 +347,20 @@ def main():
             x = x.cuda(non_blocking=True)
             target = target.cuda(non_blocking=True)
             mask = mask.cuda(non_blocking=True)
+            weak_sample_count = 0
+
+            if (
+                args.weak_subset_sampling
+                and subset_tracker is not None
+                and (epoch >= args.weak_sampling_start_epoch or args.debug)
+            ):
+                mask, weak_sample_count = resample_with_weak_subsets(
+                    mask,
+                    subset_tracker,
+                    topk=args.subsetboost_topk,
+                    probability=args.weak_sampling_prob,
+                )
+                weak_sampling_count_epoch += weak_sample_count
 
             fuse_pred, sep_preds, prm_preds = model(x, mask)
 
@@ -383,11 +451,13 @@ def main():
                 args.strong_weak_distill
                 and args.distill_lambda > 0
                 and args.distill_interval > 0
+                and (epoch >= args.distill_warmup_epoch or args.debug)
                 and step % args.distill_interval == 0
             ):
                 full_mask = torch.ones_like(mask).bool()
+                teacher_model = ema_model if ema_model is not None else model
                 with torch.no_grad():
-                    teacher_fuse_pred = model(x, full_mask)[0]
+                    teacher_fuse_pred = get_fuse_prediction(teacher_model(x, full_mask))
                 subsetboost_distill = strong_to_weak_distill_loss(
                     fuse_pred,
                     teacher_fuse_pred,
@@ -414,6 +484,9 @@ def main():
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if ema_model is not None:
+                update_ema_model(ema_model, model, args.ema_decay)
+                freeze_teacher(ema_model)
 
             ###log
             msg = 'Epoch {}/{}, Iter {}/{}, Loss {:.4f}, '.format((epoch+1), args.num_epochs, (i+1), iter_per_epoch, loss.item())
@@ -429,6 +502,8 @@ def main():
                 )
             if args.strong_weak_distill:
                 msg += 'distill:{:.4f},'.format(subsetboost_distill.item())
+            if args.weak_subset_sampling:
+                msg += 'weak_resampled:{},'.format(weak_sample_count if 'weak_sample_count' in locals() else 0)
             if booster_scale is not None:
                 msg += 'booster_scale:{:.4f},'.format(booster_scale.item())
             logging.info(msg)
@@ -462,6 +537,10 @@ def main():
             logging.info('SubsetBoost weak risk table: {}'.format(subset_tracker.summary(args.subsetboost_topk)))
         if args.strong_weak_distill:
             log_payload["subsetboost/distill"] = subsetboost_distill_epoch.cpu().detach().item() / iter_per_epoch
+        if args.weak_subset_sampling:
+            log_payload["subsetboost/weak_sampling_count"] = weak_sampling_count_epoch / iter_per_epoch
+        if ema_model is not None:
+            log_payload["subsetboost/ema_decay"] = args.ema_decay
         wandb.log(log_payload)
 
         file_name = os.path.join(ckpts, 'model_last.pth')
@@ -473,6 +552,8 @@ def main():
             }
         if args.subsetboost:
             checkpoint_payload['subsetboost_tracker'] = subset_tracker.state_dict()
+        if ema_model is not None:
+            checkpoint_payload['ema_state_dict'] = ema_model.state_dict()
         torch.save(checkpoint_payload, file_name)
         
         ########## validation and test
@@ -509,6 +590,8 @@ def main():
                     }
                 if args.subsetboost:
                     best_payload['subsetboost_tracker'] = subset_tracker.state_dict()
+                if ema_model is not None:
+                    best_payload['ema_state_dict'] = ema_model.state_dict()
                 torch.save(best_payload, file_name)
                 
             print('testing ...')
