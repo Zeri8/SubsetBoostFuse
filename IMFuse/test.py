@@ -3,6 +3,7 @@ from predict import AverageMeter, test_softmax
 from data.datasets_nii import Brats_loadall_test_nii
 from utils.lr_scheduler import MultiEpochsDataLoader 
 from IMFuse import IMFuse
+from IMFuse_no1skip import Model
 import os
 import argparse
 
@@ -12,10 +13,11 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--dataname', default='BRATS2023', type=str)
 parser.add_argument('--savepath', default=None, type=str)
 parser.add_argument('--resume', default=None, type=str)
-parser.add_argument('--test_file', default='datalist/test15splits2.csv', type=str)
+parser.add_argument('--test_file', default='datalist/test15splits.csv', type=str)
 parser.add_argument('--datapath', default="/work/grana_neuro/missing_modalities/BRATS2023_Training_npy", type=str)
 parser.add_argument('--interleaved_tokenization', action='store_true', default=False)
 parser.add_argument('--mamba_skip', action='store_true', default=False)
+parser.add_argument('--first_skip', action='store_true', default=False)
 #parser.add_argument('--debug', action='store_true', default=False)
 path = os.path.dirname(__file__)
 
@@ -41,13 +43,20 @@ if __name__ == '__main__':
     test_set = Brats_loadall_test_nii(transforms=test_transforms, root=datapath, test_file=test_file)
     test_loader = MultiEpochsDataLoader(dataset=test_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
 
-    model = IMFuse(
-                num_cls=num_cls,
-                interleaved_tokenization=args.interleaved_tokenization,
-                mamba_skip=args.mamba_skip
-            )
+    if args.first_skip:
+        model = IMFuse(
+                    num_cls=num_cls,
+                    interleaved_tokenization=args.interleaved_tokenization,
+                    mamba_skip=args.mamba_skip
+                )
+    else:
+        model = Model(
+                    num_cls=num_cls,
+                    interleaved_tokenization=args.interleaved_tokenization,
+                    mamba_skip=args.mamba_skip
+                )
     model = torch.nn.DataParallel(model).cuda()
-    checkpoint = torch.load(args.resume)
+    checkpoint = torch.load(args.resume, weights_only=False)
     model.load_state_dict(checkpoint['state_dict'])
     best_epoch = checkpoint['epoch'] + 1
     out_path = args.savepath
@@ -57,7 +66,8 @@ if __name__ == '__main__':
     with torch.no_grad():
         print('###########test set wi/wo postprocess###########')
         for i, mask in enumerate(masks[index*5:(index+1)*5]):
-            print('{}'.format(mask_name[i]))
+            mask_global_idx = index * 5 + i
+            print('{}'.format(mask_name[mask_global_idx]))
             dice_score = test_softmax(
                             test_loader,
                             model,
@@ -70,7 +80,7 @@ if __name__ == '__main__':
             val_WT, val_TC, val_ET, val_ETpp = dice_score
             
             with open(output_path, 'a') as file:
-                file.write('Performance missing scenario = {}, WT = {:.4f}, TC = {:.4f}, ET = {:.4f}, ETpp = {:.4f}\n'.format(mask, val_WT.item(), val_TC.item(), val_ET.item(), val_ETpp.item()))
+                file.write('Performance missing scenario = {} ({}), WT = {:.4f}, TC = {:.4f}, ET = {:.4f}, ETpp = {:.4f}\n'.format(mask_name[mask_global_idx], mask, val_WT.item(), val_TC.item(), val_ET.item(), val_ETpp.item()))
 
             test_score.update(dice_score)
         print('Avg scores: {}'.format(test_score.avg))

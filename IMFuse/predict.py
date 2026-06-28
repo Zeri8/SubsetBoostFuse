@@ -16,6 +16,15 @@ from utils.generate import generate_snapshot
 
 patch_size = 128
 
+def build_sliding_indices(size, window, overlap=0.5):
+    if size <= window:
+        return [0]
+    step = int(window * (1 - overlap))
+    max_start = size - window
+    indices = list(range(0, max_start, step))
+    indices.append(max_start)
+    return sorted(set(indices))
+
 def mask_modal(x, mask):
     #B, C, H, W, Z = x.size()
     y = torch.zeros_like(x)
@@ -166,23 +175,21 @@ def test_softmax(
         else:
             mask = data[2]
         mask = mask.cuda()
+        _, _, orig_H, orig_W, orig_Z = x.size()
+
+        pad_h = max(0, patch_size - orig_H)
+        pad_w = max(0, patch_size - orig_W)
+        pad_z = max(0, patch_size - orig_Z)
+        if pad_h > 0 or pad_w > 0 or pad_z > 0:
+            x = F.pad(x, (0, pad_z, 0, pad_w, 0, pad_h), mode="constant", value=0)
+            yo = F.pad(yo, (0, pad_z, 0, pad_w, 0, pad_h), mode="constant", value=0)
+
         _, _, H, W, Z = x.size()
 
         #########get h_ind, w_ind, z_ind for sliding windows
-        h_cnt = int(np.ceil((H - patch_size) / (patch_size * (1 - 0.5))))
-        h_idx_list = range(0, h_cnt)
-        h_idx_list = [h_idx * int(patch_size * (1 - 0.5)) for h_idx in h_idx_list]
-        h_idx_list.append(H - patch_size)
-
-        w_cnt = int(np.ceil((W - patch_size) / (patch_size * (1 - 0.5))))
-        w_idx_list = range(0, w_cnt)
-        w_idx_list = [w_idx * int(patch_size * (1 - 0.5)) for w_idx in w_idx_list]
-        w_idx_list.append(W - patch_size)
-
-        z_cnt = int(np.ceil((Z - patch_size) / (patch_size * (1 - 0.5))))
-        z_idx_list = range(0, z_cnt)
-        z_idx_list = [z_idx * int(patch_size * (1 - 0.5)) for z_idx in z_idx_list]
-        z_idx_list.append(Z - patch_size)
+        h_idx_list = build_sliding_indices(H, patch_size)
+        w_idx_list = build_sliding_indices(W, patch_size)
+        z_idx_list = build_sliding_indices(Z, patch_size)
 
         #####compute calculation times for each pixel in sliding windows
         weight1 = torch.zeros(1, 1, H, W, Z).float().cuda()
@@ -203,13 +210,14 @@ def test_softmax(
                     pred[:, :, h:h+patch_size, w:w+patch_size, z:z+patch_size] += pred_part
         pred = pred / weight
         b = time.time()
-        pred = pred[:, :, :H, :W, :T]
+        pred = pred[:, :, :orig_H, :orig_W, :orig_Z]
+        yo_eval = yo[:, :, :orig_H, :orig_W, :orig_Z]
 
         
         # segmentation loss 
         if compute_loss:
-            seg_cross_loss = criterions.softmax_weighted_loss(pred, yo, num_cls=num_cls)
-            seg_dice_loss = criterions.dice_loss(pred, yo, num_cls=num_cls)
+            seg_cross_loss = criterions.softmax_weighted_loss(pred, yo_eval, num_cls=num_cls)
+            seg_dice_loss = criterions.dice_loss(pred, yo_eval, num_cls=num_cls)
             seg_loss = seg_cross_loss + seg_dice_loss
             loss += seg_loss
 
@@ -248,16 +256,22 @@ def test_softmax(
                 nib.save(nib.Nifti1Image(pred_np, affine), out_path)
 
             # write scores
-            case_scores = scores_evaluation[k][0:3]
-            avg_score = float(np.mean(case_scores))
+            if save_dir is not None:
+                case_scores = scores_evaluation[k][0:3]
+                avg_score = float(np.mean(case_scores))
+                flags_bool = mask[k].bool().cpu().numpy().tolist()
+                flag_str = ''.join(['1' if f else '0' for f in flags_bool])
+                case_name = names[k]
+                out_name = f"{case_name}_{flag_str}.nii.gz"
 
-            txt_path = os.path.join(save_dir, f"scores_{index}.txt")
-            with open(txt_path, "a") as f:
-                f.write(
-                    f"{out_name} "                                        
-                    + " ".join([f"{s:.4f}" for s in case_scores]) + " "    
-                    + f"{avg_score:.4f}\n"                                 
-                )
+                os.makedirs(save_dir, exist_ok=True)
+                txt_path = os.path.join(save_dir, f"scores_{index}.txt")
+                with open(txt_path, "a") as f:
+                    f.write(
+                        f"{out_name} "
+                        + " ".join([f"{s:.4f}" for s in case_scores]) + " "
+                        + f"{avg_score:.4f}\n"
+                    )
         
 
     

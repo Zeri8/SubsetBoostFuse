@@ -18,6 +18,7 @@ join = os.path.join
 import pandas as pd
 import random
 
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 patch_size = 128
 
 HGG = []
@@ -33,11 +34,26 @@ mask_array = np.array([[True, False, False, False], [False, True, False, False],
                       [True, True, False, False], [True, False, True, False], [True, False, False, True], [False, True, True, False], [False, True, False, True], [False, False, True, True], [True, True, True, False], [True, True, False, True], [True, False, True, True], [False, True, True, True],
                       [True, True, True, True]])
 
+def resolve_datalist_file(file_name):
+    if os.path.isabs(file_name):
+        return file_name
+    if file_name.startswith('datalist/'):
+        return os.path.join(PROJECT_ROOT, file_name)
+    return os.path.join(PROJECT_ROOT, 'datalist', file_name)
+
+
+def has_preprocessed_case(root, case_name):
+    return (
+        os.path.exists(os.path.join(root, 'vol', case_name + '_vol.npy')) and
+        os.path.exists(os.path.join(root, 'seg', case_name + '_seg.npy'))
+    )
+
 class Brats_loadall_nii(Dataset):
     def __init__(self, transforms='', root=None, modal='all', num_cls=4, train_file='train.txt'):
-        data_file_path = os.path.join('/work/grana_neuro/missing_modalities/IMFuse', train_file)
+        data_file_path = resolve_datalist_file(train_file)
         with open(data_file_path, 'r') as f:
             datalist = [i.strip() for i in f.readlines()] #875 elements
+        datalist = [case for case in datalist if has_preprocessed_case(root, case)]
         # datalist.sort()
 
         volpaths = []
@@ -92,8 +108,9 @@ class Brats_loadall_nii(Dataset):
 
 class Brats_loadall_test_nii(Dataset):
     def __init__(self, transforms='', root=None, test_file='test.txt', modal='all', num_cls=4):
-        data_file_path = os.path.join('/work/grana_neuro/missing_modalities/IMFuse', test_file)
+        data_file_path = resolve_datalist_file(test_file)
         df = pd.read_csv(data_file_path)
+        df = df[df['case'].apply(lambda case: has_preprocessed_case(root, case))].reset_index(drop=True)
         datalist = df['case']
         #with open(data_file_path, 'r') as f:
         #    datalist = [i.strip() for i in f.readlines()] #251 elements
@@ -155,8 +172,9 @@ class Brats_loadall_test_nii(Dataset):
 
 class Brats_loadall_val_nii(Dataset):
     def __init__(self, transforms='', root=None, val_file='val.txt', modal='all', num_cls=4):
-        data_file_path = os.path.join('/work/grana_neuro/missing_modalities/IMFuse', val_file)
+        data_file_path = resolve_datalist_file(val_file)
         df = pd.read_csv(data_file_path)
+        df = df[df['case'].apply(lambda case: has_preprocessed_case(root, case))].reset_index(drop=True)
         datalist = df['case']
         #with open(data_file_path, 'r') as f:
         #    datalist = [i.strip() for i in f.readlines()]

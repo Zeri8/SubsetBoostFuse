@@ -20,6 +20,14 @@ from utils.parser import setup
 from utils.lr_scheduler import LR_Scheduler, record_loss, MultiEpochsDataLoader 
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from predict import AverageMeter, test_softmax
+from utils.subsetboost import (
+    SubsetRiskTracker,
+    lattice_ranking_loss,
+    make_random_superset_mask,
+    mask_to_subset_indices,
+    per_sample_seg_loss,
+    subset_cvar_loss,
+)
 
 DEBUG_ITER = 1
 
@@ -40,6 +48,18 @@ parser.add_argument('--debug', action='store_true', default=False)
 parser.add_argument('--interleaved_tokenization', action='store_true', default=False)
 parser.add_argument('--mamba_skip', action='store_true', default=False)
 parser.add_argument('--first_skip', action='store_true', default=False)
+parser.add_argument('--wandb_mode', default='disabled', type=str, choices=['online', 'offline', 'disabled'])
+parser.add_argument('--subsetboost', action='store_true', default=False)
+parser.add_argument('--subsetboost_warmup_epoch', default=5, type=int)
+parser.add_argument('--subsetboost_topk', default=3, type=int)
+parser.add_argument('--subsetboost_ema', default=0.95, type=float)
+parser.add_argument('--subsetboost_cvar_fraction', default=0.5, type=float)
+parser.add_argument('--subsetboost_cvar_lambda', default=0.2, type=float)
+parser.add_argument('--subsetboost_weak_lambda', default=0.2, type=float)
+parser.add_argument('--subsetboost_weak_weight', default=1.0, type=float)
+parser.add_argument('--subsetboost_rank_lambda', default=0.05, type=float)
+parser.add_argument('--subsetboost_rank_margin', default=0.02, type=float)
+parser.add_argument('--subsetboost_rank_interval', default=4, type=int)
 path = os.path.dirname(__file__)
 
 ## parse arguments
@@ -81,9 +101,7 @@ def main():
     ##########init wandb
     slurm_job_id = os.getenv("SLURM_JOB_ID") 
     wandb_name_and_id = f'{args.dataname}_IMFuse{"no_1_skip" if not args.first_skip else ""}_{"Interleaved" if args.interleaved_tokenization else ""}{"Skip" if args.mamba_skip else ""}_jobid{slurm_job_id}'
-    wandb_mode = 'online'
-    # if args.debug:
-    #     wandb_mode = 'disabled'
+    wandb_mode = args.wandb_mode
     wandb.init(
         project="SegmentationMM",
         name=wandb_name_and_id,
@@ -135,7 +153,7 @@ def main():
     ########## Setting data
     if args.dataname in ['BRATS2023', 'BRATS2020', 'BRATS2015']:
         train_file = 'datalist/train.txt'
-        test_file = 'datalist/test15splits2.csv'
+        test_file = 'datalist/test15splits.csv'
         val_file = 'datalist/val15splits.csv'
         #test_file = 'datalist/test.txt'
         #val_file = 'datalist/val.txt'
@@ -186,15 +204,18 @@ def main():
     train_iter = iter(train_loader)
     val_Dice_best = -999999
     start_epoch = 0
+    subset_tracker = SubsetRiskTracker(momentum=args.subsetboost_ema, device=torch.device('cuda')) if args.subsetboost else None
 
     ##########Resume Training
     if args.resume is not None:
-        checkpoint = torch.load(args.resume)
+        checkpoint = torch.load(args.resume, weights_only=False)
         logging.info('best epoch: {}'.format(checkpoint['epoch']))
         model.load_state_dict(checkpoint['state_dict'])
         val_Dice_best = checkpoint['val_Dice_best']
         optimizer.load_state_dict(checkpoint['optim_dict'])
         start_epoch = checkpoint['epoch'] + 1
+        if subset_tracker is not None and 'subsetboost_tracker' in checkpoint:
+            subset_tracker.load_state_dict(checkpoint['subsetboost_tracker'])
 
     for epoch in range(start_epoch, args.num_epochs):
         step_lr = lr_schedule(optimizer, epoch)
@@ -210,6 +231,10 @@ def main():
         sep_cross_loss_epoch = 0.0
         sep_dice_loss_epoch = 0.0
         loss_epoch = 0.0
+        subsetboost_loss_epoch = 0.0
+        subsetboost_cvar_epoch = 0.0
+        subsetboost_weak_epoch = 0.0
+        subsetboost_rank_epoch = 0.0
 
         ########## training epoch
         for i in range(iter_per_epoch):
@@ -258,11 +283,67 @@ def main():
             prm_cross_loss_epoch += prm_cross_loss
             prm_dice_loss_epoch += prm_dice_loss
 
+            subsetboost_loss = torch.zeros(1).cuda().float()
+            subsetboost_cvar = torch.zeros(1).cuda().float()
+            subsetboost_weak = torch.zeros(1).cuda().float()
+            subsetboost_rank = torch.zeros(1).cuda().float()
+            if args.subsetboost:
+                subset_indices = mask_to_subset_indices(mask)
+                fuse_sample_losses = per_sample_seg_loss(fuse_pred, target, num_cls, criterions)
+                subset_tracker.update(subset_indices, fuse_sample_losses)
+
+                if epoch >= args.subsetboost_warmup_epoch:
+                    subsetboost_cvar = subset_cvar_loss(
+                        fuse_sample_losses,
+                        args.subsetboost_cvar_fraction,
+                    )
+                    subsetboost_weak = subset_tracker.weak_weighted_loss(
+                        fuse_sample_losses,
+                        subset_indices,
+                        args.subsetboost_topk,
+                        args.subsetboost_weak_weight,
+                    )
+                    subsetboost_loss = (
+                        args.subsetboost_cvar_lambda * subsetboost_cvar
+                        + args.subsetboost_weak_lambda * subsetboost_weak
+                    )
+
+                    if (
+                        args.subsetboost_rank_lambda > 0
+                        and args.subsetboost_rank_interval > 0
+                        and step % args.subsetboost_rank_interval == 0
+                    ):
+                        superset_mask, valid_rank = make_random_superset_mask(mask)
+                        if torch.any(valid_rank):
+                            superset_fuse_pred = model(x, superset_mask)[0]
+                            superset_losses = per_sample_seg_loss(
+                                superset_fuse_pred,
+                                target,
+                                num_cls,
+                                criterions,
+                            )
+                            subsetboost_rank = lattice_ranking_loss(
+                                fuse_sample_losses,
+                                superset_losses,
+                                valid_rank,
+                                args.subsetboost_rank_margin,
+                            )
+                            subsetboost_loss = (
+                                subsetboost_loss
+                                + args.subsetboost_rank_lambda * subsetboost_rank
+                            )
+
+            subsetboost_loss_epoch += subsetboost_loss
+            subsetboost_cvar_epoch += subsetboost_cvar
+            subsetboost_weak_epoch += subsetboost_weak
+            subsetboost_rank_epoch += subsetboost_rank
+
             ### total segmentation loss
             if epoch < args.region_fusion_start_epoch:
                 loss = fuse_loss * 0.0 + sep_loss + prm_loss
             else:
                 loss = fuse_loss + sep_loss + prm_loss
+            loss = loss + subsetboost_loss
 
             loss_epoch += loss
 
@@ -276,6 +357,13 @@ def main():
             msg += 'fusecross:{:.4f}, fusedice:{:.4f},'.format(fuse_cross_loss.item(), fuse_dice_loss.item())
             msg += 'sepcross:{:.4f}, sepdice:{:.4f},'.format(sep_cross_loss.item(), sep_dice_loss.item())
             msg += 'prmcross:{:.4f}, prmdice:{:.4f},'.format(prm_cross_loss.item(), prm_dice_loss.item())
+            if args.subsetboost:
+                msg += 'subsetboost:{:.4f}, cvar:{:.4f}, weak:{:.4f}, rank:{:.4f},'.format(
+                    subsetboost_loss.item(),
+                    subsetboost_cvar.item(),
+                    subsetboost_weak.item(),
+                    subsetboost_rank.item(),
+                )
             logging.info(msg)
 
             """
@@ -286,7 +374,7 @@ def main():
         logging.info('train time per epoch: {}'.format(time.time() - b))
 
         ########## log current epoch metrics and save current model 
-        wandb.log({
+        log_payload = {
             "train/epoch": epoch,
             "train/loss": loss_epoch.cpu().detach().item() / iter_per_epoch,
             "train/fusecross": fuse_cross_loss_epoch.cpu().detach().item() / iter_per_epoch,
@@ -296,16 +384,27 @@ def main():
             "train/prmcross": prm_cross_loss_epoch.cpu().detach().item() / iter_per_epoch,
             "train/prmdice": prm_dice_loss_epoch.cpu().detach().item() / iter_per_epoch,
             "train/learning_rate": step_lr,
-        })
+        }
+        if args.subsetboost:
+            log_payload.update({
+                "subsetboost/loss": subsetboost_loss_epoch.cpu().detach().item() / iter_per_epoch,
+                "subsetboost/cvar": subsetboost_cvar_epoch.cpu().detach().item() / iter_per_epoch,
+                "subsetboost/weak": subsetboost_weak_epoch.cpu().detach().item() / iter_per_epoch,
+                "subsetboost/rank": subsetboost_rank_epoch.cpu().detach().item() / iter_per_epoch,
+            })
+            logging.info('SubsetBoost weak risk table: {}'.format(subset_tracker.summary(args.subsetboost_topk)))
+        wandb.log(log_payload)
 
         file_name = os.path.join(ckpts, 'model_last.pth')
-        torch.save({
+        checkpoint_payload = {
             'epoch': epoch,
             'state_dict': model.state_dict(),
             'optim_dict': optimizer.state_dict(),
             'val_Dice_best': val_Dice_best,
-            },
-            file_name)
+            }
+        if args.subsetboost:
+            checkpoint_payload['subsetboost_tracker'] = subset_tracker.state_dict()
+        torch.save(checkpoint_payload, file_name)
         
         ########## validation and test
         if epoch+1 in val_check or args.debug:
@@ -333,13 +432,15 @@ def main():
                 val_Dice_best = val_dice.item()
                 print('save best model ...')
                 file_name = os.path.join(ckpts, 'best.pth')
-                torch.save({
+                best_payload = {
                     'epoch': epoch,
                     'state_dict': model.state_dict(),
                     'optim_dict': optimizer.state_dict(),
                     'val_Dice_best': val_Dice_best,
-                    },
-                    file_name)
+                    }
+                if args.subsetboost:
+                    best_payload['subsetboost_tracker'] = subset_tracker.state_dict()
+                torch.save(best_payload, file_name)
                 
             print('testing ...')
             with torch.no_grad():
