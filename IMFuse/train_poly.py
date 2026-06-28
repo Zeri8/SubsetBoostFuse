@@ -79,6 +79,7 @@ parser.add_argument('--weak_subset_sampling', action='store_true', default=False
 parser.add_argument('--weak_sampling_start_epoch', default=50, type=int)
 parser.add_argument('--weak_sampling_prob', default=0.5, type=float)
 parser.add_argument('--val_interval', default=50, type=int)
+parser.add_argument('--no_eval_during_training', action='store_true', default=False)
 path = os.path.dirname(__file__)
 
 ## parse arguments
@@ -557,7 +558,11 @@ def main():
         torch.save(checkpoint_payload, file_name)
         
         ########## validation and test
-        if epoch+1 in val_check or args.debug or (args.val_interval > 0 and (epoch + 1) % args.val_interval == 0):
+        should_eval = (
+            not args.no_eval_during_training
+            and (epoch+1 in val_check or args.debug or (args.val_interval > 0 and (epoch + 1) % args.val_interval == 0))
+        )
+        if should_eval:
             print('validate ...')
             with torch.no_grad():
                 dice_score, seg_loss = test_softmax(
