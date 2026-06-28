@@ -60,6 +60,15 @@ parser.add_argument('--subsetboost_weak_weight', default=1.0, type=float)
 parser.add_argument('--subsetboost_rank_lambda', default=0.05, type=float)
 parser.add_argument('--subsetboost_rank_margin', default=0.02, type=float)
 parser.add_argument('--subsetboost_rank_interval', default=4, type=int)
+parser.add_argument('--subset_adapter', action='store_true', default=False)
+parser.add_argument('--residual_boost', action='store_true', default=False)
+parser.add_argument('--booster_hidden', default=16, type=int)
+parser.add_argument('--residual_alpha', default=0.1, type=float)
+parser.add_argument('--strong_weak_distill', action='store_true', default=False)
+parser.add_argument('--distill_lambda', default=0.05, type=float)
+parser.add_argument('--distill_conf', default=0.7, type=float)
+parser.add_argument('--distill_interval', default=4, type=int)
+parser.add_argument('--val_interval', default=50, type=int)
 path = os.path.dirname(__file__)
 
 ## parse arguments
@@ -88,6 +97,17 @@ print (masks_torch.int())
 
 val_check = [50, 100, 150, 200, 300, 400, 500, 600, 700, 800, 850, 900, 910, 920, 930, 940, 950, 955, 960, 965, 970, 975, 980, 985, 990, 995, 1000] 
 print(f"Validation checks: {val_check}")
+
+def strong_to_weak_distill_loss(student_pred, teacher_pred, confidence=0.7, eps=1e-6):
+    teacher_prob = teacher_pred.detach().clamp(min=eps, max=1.0)
+    student_prob = student_pred.clamp(min=eps, max=1.0)
+    confidence_map = teacher_prob.max(dim=1, keepdim=True).values
+    valid = (confidence_map >= confidence).float()
+    if torch.sum(valid) < 1:
+        valid = torch.ones_like(valid)
+    kl_map = torch.sum(teacher_prob * (torch.log(teacher_prob) - torch.log(student_prob)), dim=1, keepdim=True)
+    return torch.sum(kl_map * valid) / torch.clamp(torch.sum(valid), min=1.0)
+
 
 def main():
     ##########setting seed
@@ -119,6 +139,10 @@ def main():
             "region_fusion_start_epoch": args.region_fusion_start_epoch,
             "interleaved_tokenization": args.interleaved_tokenization,
             "mamba_skip": args.mamba_skip,
+            "subsetboost": args.subsetboost,
+            "subset_adapter": args.subset_adapter,
+            "residual_boost": args.residual_boost,
+            "strong_weak_distill": args.strong_weak_distill,
         }
     )
     
@@ -135,12 +159,20 @@ def main():
                     num_cls=num_cls, 
                     interleaved_tokenization=args.interleaved_tokenization,
                     mamba_skip=args.mamba_skip,
+                    subset_adapter=args.subset_adapter,
+                    residual_boost=args.residual_boost,
+                    booster_hidden=args.booster_hidden,
+                    residual_alpha=args.residual_alpha,
             )
     else:
         model = Model(
                         num_cls=num_cls, 
                         interleaved_tokenization=args.interleaved_tokenization,
                         mamba_skip=args.mamba_skip,
+                        subset_adapter=args.subset_adapter,
+                        residual_boost=args.residual_boost,
+                        booster_hidden=args.booster_hidden,
+                        residual_alpha=args.residual_alpha,
                 )
     print (model)
     model = torch.nn.DataParallel(model).cuda()
@@ -210,9 +242,20 @@ def main():
     if args.resume is not None:
         checkpoint = torch.load(args.resume, weights_only=False)
         logging.info('best epoch: {}'.format(checkpoint['epoch']))
-        model.load_state_dict(checkpoint['state_dict'])
+        allow_new_subset_modules = args.subset_adapter or args.residual_boost
+        load_result = model.load_state_dict(
+            checkpoint['state_dict'],
+            strict=not allow_new_subset_modules,
+        )
+        if allow_new_subset_modules:
+            logging.info('Resume missing keys: {}'.format(load_result.missing_keys))
+            logging.info('Resume unexpected keys: {}'.format(load_result.unexpected_keys))
         val_Dice_best = checkpoint['val_Dice_best']
-        optimizer.load_state_dict(checkpoint['optim_dict'])
+        if 'optim_dict' in checkpoint:
+            try:
+                optimizer.load_state_dict(checkpoint['optim_dict'])
+            except ValueError as exc:
+                logging.warning('Skip optimizer state because model parameters changed: {}'.format(exc))
         start_epoch = checkpoint['epoch'] + 1
         if subset_tracker is not None and 'subsetboost_tracker' in checkpoint:
             subset_tracker.load_state_dict(checkpoint['subsetboost_tracker'])
@@ -235,6 +278,7 @@ def main():
         subsetboost_cvar_epoch = 0.0
         subsetboost_weak_epoch = 0.0
         subsetboost_rank_epoch = 0.0
+        subsetboost_distill_epoch = 0.0
 
         ########## training epoch
         for i in range(iter_per_epoch):
@@ -287,6 +331,8 @@ def main():
             subsetboost_cvar = torch.zeros(1).cuda().float()
             subsetboost_weak = torch.zeros(1).cuda().float()
             subsetboost_rank = torch.zeros(1).cuda().float()
+            subsetboost_distill = torch.zeros(1).cuda().float()
+            booster_scale = getattr(model.module.decoder_fuse, 'last_booster_scale', None)
             if args.subsetboost:
                 subset_indices = mask_to_subset_indices(mask)
                 fuse_sample_losses = per_sample_seg_loss(fuse_pred, target, num_cls, criterions)
@@ -333,10 +379,27 @@ def main():
                                 + args.subsetboost_rank_lambda * subsetboost_rank
                             )
 
+            if (
+                args.strong_weak_distill
+                and args.distill_lambda > 0
+                and args.distill_interval > 0
+                and step % args.distill_interval == 0
+            ):
+                full_mask = torch.ones_like(mask).bool()
+                with torch.no_grad():
+                    teacher_fuse_pred = model(x, full_mask)[0]
+                subsetboost_distill = strong_to_weak_distill_loss(
+                    fuse_pred,
+                    teacher_fuse_pred,
+                    confidence=args.distill_conf,
+                )
+                subsetboost_loss = subsetboost_loss + args.distill_lambda * subsetboost_distill
+
             subsetboost_loss_epoch += subsetboost_loss
             subsetboost_cvar_epoch += subsetboost_cvar
             subsetboost_weak_epoch += subsetboost_weak
             subsetboost_rank_epoch += subsetboost_rank
+            subsetboost_distill_epoch += subsetboost_distill
 
             ### total segmentation loss
             if epoch < args.region_fusion_start_epoch:
@@ -364,6 +427,10 @@ def main():
                     subsetboost_weak.item(),
                     subsetboost_rank.item(),
                 )
+            if args.strong_weak_distill:
+                msg += 'distill:{:.4f},'.format(subsetboost_distill.item())
+            if booster_scale is not None:
+                msg += 'booster_scale:{:.4f},'.format(booster_scale.item())
             logging.info(msg)
 
             """
@@ -393,6 +460,8 @@ def main():
                 "subsetboost/rank": subsetboost_rank_epoch.cpu().detach().item() / iter_per_epoch,
             })
             logging.info('SubsetBoost weak risk table: {}'.format(subset_tracker.summary(args.subsetboost_topk)))
+        if args.strong_weak_distill:
+            log_payload["subsetboost/distill"] = subsetboost_distill_epoch.cpu().detach().item() / iter_per_epoch
         wandb.log(log_payload)
 
         file_name = os.path.join(ckpts, 'model_last.pth')
@@ -407,7 +476,7 @@ def main():
         torch.save(checkpoint_payload, file_name)
         
         ########## validation and test
-        if epoch+1 in val_check or args.debug:
+        if epoch+1 in val_check or args.debug or (args.val_interval > 0 and (epoch + 1) % args.val_interval == 0):
             print('validate ...')
             with torch.no_grad():
                 dice_score, seg_loss = test_softmax(

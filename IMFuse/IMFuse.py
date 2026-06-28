@@ -7,6 +7,7 @@ from layers import general_conv3d_prenorm, fusion_prenorm
 from mamba_ssm import Mamba
 from torch.cuda.amp import autocast
 from utils.initialization import InitWeights_He
+from subsetboost_modules import ResidualBooster3D, SubsetAwareAdapter3D
 
 basic_dims = 8 #5 for SS
 transformer_basic_dims = 512
@@ -202,7 +203,15 @@ class Decoder_sep(nn.Module):
         return pred 
 
 class Decoder_fuse(nn.Module):
-    def __init__(self, num_cls=4, mamba_skip=False):
+    def __init__(
+        self,
+        num_cls=4,
+        mamba_skip=False,
+        subset_adapter=False,
+        residual_boost=False,
+        booster_hidden=16,
+        residual_alpha=0.1,
+    ):
         super(Decoder_fuse, self).__init__()
 
         self.d4_c1 = general_conv3d_prenorm(basic_dims*16, basic_dims*8, pad_type='reflect')
@@ -239,9 +248,23 @@ class Decoder_fuse(nn.Module):
         self.RFM2 = fusion_prenorm(in_channel=basic_dims*2, num_cls= 1 if mamba_skip else num_cls)
         self.RFM1 = fusion_prenorm(in_channel=basic_dims*1, num_cls=1 if mamba_skip else num_cls)
         self.mamba_skip = mamba_skip
+        self.use_subset_adapter = subset_adapter
+        self.use_residual_boost = residual_boost
+        self.subset_adapter = SubsetAwareAdapter3D(basic_dims) if subset_adapter else None
+        self.residual_booster = (
+            ResidualBooster3D(num_cls, hidden=booster_hidden, init_scale=residual_alpha)
+            if residual_boost
+            else None
+        )
+        self.last_booster_scale = None
 
+    def reset_subsetboost_parameters(self):
+        if self.subset_adapter is not None:
+            self.subset_adapter.reset_stable_parameters()
+        if self.residual_booster is not None:
+            self.residual_booster.reset_stable_parameters()
 
-    def forward(self, x1, x2, x3, x4, x5):
+    def forward(self, x1, x2, x3, x4, x5, mask=None):
         de_x5 = self.RFM5(x5)                       #(B, 128, 8, 8, 8)
         pred4 = self.softmax(self.seg_d4(de_x5))
         de_x5 = self.d4_c1(self.up2(de_x5))         #(B, 64, 16, 16, 16)
@@ -268,8 +291,16 @@ class Decoder_fuse(nn.Module):
         de_x1 = torch.cat((de_x1, de_x2), dim=1)  #(B, 16, 128, 128, 128)
         de_x1 = self.d1_out(self.d1_c2(de_x1))      #(B, 8, 128, 128, 128)
 
+        if self.subset_adapter is not None and mask is not None:
+            de_x1 = self.subset_adapter(de_x1, mask)
+
         logits = self.seg_layer(de_x1)              #(B, 4, 128, 128, 128)
         pred = self.softmax(logits)                 #(B, 4, 128, 128, 128)
+        if self.residual_booster is not None and mask is not None:
+            pred, scale = self.residual_booster(pred, mask)
+            self.last_booster_scale = scale.detach()
+        else:
+            self.last_booster_scale = None
 
         return pred, (self.up2(pred1), self.up4(pred2), self.up8(pred3), self.up16(pred4))
 
@@ -405,7 +436,16 @@ class MaskModal(nn.Module):
 
                                           
 class IMFuse(nn.Module):
-    def __init__(self, num_cls=4, interleaved_tokenization=False, mamba_skip=False):
+    def __init__(
+        self,
+        num_cls=4,
+        interleaved_tokenization=False,
+        mamba_skip=False,
+        subset_adapter=False,
+        residual_boost=False,
+        booster_hidden=16,
+        residual_alpha=0.1,
+    ):
         super(IMFuse, self).__init__()
         self.interleaved_tokenization = interleaved_tokenization
 
@@ -470,13 +510,21 @@ class IMFuse(nn.Module):
         ])
         ########
 
-        self.decoder_fuse = Decoder_fuse(num_cls=num_cls, mamba_skip=mamba_skip)
+        self.decoder_fuse = Decoder_fuse(
+            num_cls=num_cls,
+            mamba_skip=mamba_skip,
+            subset_adapter=subset_adapter,
+            residual_boost=residual_boost,
+            booster_hidden=booster_hidden,
+            residual_alpha=residual_alpha,
+        )
         self.decoder_sep = Decoder_sep(num_cls=num_cls)
 
         self.is_training = False
         self.mamba_skip = mamba_skip
 
         self.apply(InitWeights_He(1e-2))
+        self.decoder_fuse.reset_subsetboost_parameters()
 
     def forward(self, x, mask):
         #extract feature from different layers
@@ -541,7 +589,7 @@ class IMFuse(nn.Module):
         multimodal_inter_x5 = self.multimodal_decode_conv(multimodal_inter_token_x5.view(multimodal_inter_token_x5.size(0), patch_size, patch_size, patch_size, transformer_basic_dims).permute(0, 4, 1, 2, 3).contiguous()) #(B, 512, 8, 8, 8) -> (B, 512, 8, 8, 8)
         x5_inter = multimodal_inter_x5
 
-        fuse_pred, preds = self.decoder_fuse(x1, x2, x3, x4, x5_inter)
+        fuse_pred, preds = self.decoder_fuse(x1, x2, x3, x4, x5_inter, mask=mask)
         ########### InterFormer
         
         if self.is_training:

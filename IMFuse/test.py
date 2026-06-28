@@ -18,6 +18,10 @@ parser.add_argument('--datapath', default="/work/grana_neuro/missing_modalities/
 parser.add_argument('--interleaved_tokenization', action='store_true', default=False)
 parser.add_argument('--mamba_skip', action='store_true', default=False)
 parser.add_argument('--first_skip', action='store_true', default=False)
+parser.add_argument('--subset_adapter', action='store_true', default=False)
+parser.add_argument('--residual_boost', action='store_true', default=False)
+parser.add_argument('--booster_hidden', default=16, type=int)
+parser.add_argument('--residual_alpha', default=0.1, type=float)
 #parser.add_argument('--debug', action='store_true', default=False)
 path = os.path.dirname(__file__)
 
@@ -39,6 +43,12 @@ if __name__ == '__main__':
     num_cls = 4
     dataname = args.dataname
     index = int(os.environ.get("SLURM_ARRAY_TASK_ID", 0))
+    checkpoint = torch.load(args.resume, weights_only=False)
+    state_dict = checkpoint['state_dict']
+    checkpoint_has_adapter = any('subset_adapter' in key for key in state_dict)
+    checkpoint_has_booster = any('residual_booster' in key for key in state_dict)
+    subset_adapter = args.subset_adapter or checkpoint_has_adapter
+    residual_boost = args.residual_boost or checkpoint_has_booster
 
     test_set = Brats_loadall_test_nii(transforms=test_transforms, root=datapath, test_file=test_file)
     test_loader = MultiEpochsDataLoader(dataset=test_set, batch_size=1, shuffle=False, num_workers=0, pin_memory=True)
@@ -47,17 +57,27 @@ if __name__ == '__main__':
         model = IMFuse(
                     num_cls=num_cls,
                     interleaved_tokenization=args.interleaved_tokenization,
-                    mamba_skip=args.mamba_skip
+                    mamba_skip=args.mamba_skip,
+                    subset_adapter=subset_adapter,
+                    residual_boost=residual_boost,
+                    booster_hidden=args.booster_hidden,
+                    residual_alpha=args.residual_alpha,
                 )
     else:
         model = Model(
                     num_cls=num_cls,
                     interleaved_tokenization=args.interleaved_tokenization,
-                    mamba_skip=args.mamba_skip
+                    mamba_skip=args.mamba_skip,
+                    subset_adapter=subset_adapter,
+                    residual_boost=residual_boost,
+                    booster_hidden=args.booster_hidden,
+                    residual_alpha=args.residual_alpha,
                 )
     model = torch.nn.DataParallel(model).cuda()
-    checkpoint = torch.load(args.resume, weights_only=False)
-    model.load_state_dict(checkpoint['state_dict'])
+    load_result = model.load_state_dict(state_dict, strict=False)
+    if load_result.missing_keys or load_result.unexpected_keys:
+        print('missing keys:', load_result.missing_keys)
+        print('unexpected keys:', load_result.unexpected_keys)
     best_epoch = checkpoint['epoch'] + 1
     out_path = args.savepath
     output_path = f"{out_path}_{best_epoch}_{index}.txt"
