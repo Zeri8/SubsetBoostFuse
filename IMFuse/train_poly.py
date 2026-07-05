@@ -375,8 +375,8 @@ def main():
             fuse_dice_loss_epoch += fuse_dice_loss
 
             ### separated modality segmentation loss
-            sep_cross_loss = torch.zeros(1).cuda().float()
-            sep_dice_loss = torch.zeros(1).cuda().float()
+            sep_cross_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+            sep_dice_loss = torch.zeros((), device=x.device, dtype=torch.float32)
             for sep_pred in sep_preds:
                 sep_cross_loss += criterions.softmax_weighted_loss(sep_pred, target, num_cls=num_cls)
                 sep_dice_loss += criterions.dice_loss(sep_pred, target, num_cls=num_cls)
@@ -386,8 +386,8 @@ def main():
             sep_dice_loss_epoch += sep_dice_loss
 
             ### pyramid segmentation loss
-            prm_cross_loss = torch.zeros(1).cuda().float()
-            prm_dice_loss = torch.zeros(1).cuda().float()
+            prm_cross_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+            prm_dice_loss = torch.zeros((), device=x.device, dtype=torch.float32)
             for prm_pred in prm_preds:
                 prm_cross_loss += criterions.softmax_weighted_loss(prm_pred, target, num_cls=num_cls)
                 prm_dice_loss += criterions.dice_loss(prm_pred, target, num_cls=num_cls)
@@ -396,11 +396,11 @@ def main():
             prm_cross_loss_epoch += prm_cross_loss
             prm_dice_loss_epoch += prm_dice_loss
 
-            subsetboost_loss = torch.zeros(1).cuda().float()
-            subsetboost_cvar = torch.zeros(1).cuda().float()
-            subsetboost_weak = torch.zeros(1).cuda().float()
-            subsetboost_rank = torch.zeros(1).cuda().float()
-            subsetboost_distill = torch.zeros(1).cuda().float()
+            subsetboost_loss = torch.zeros((), device=x.device, dtype=torch.float32)
+            subsetboost_cvar = torch.zeros((), device=x.device, dtype=torch.float32)
+            subsetboost_weak = torch.zeros((), device=x.device, dtype=torch.float32)
+            subsetboost_rank = torch.zeros((), device=x.device, dtype=torch.float32)
+            subsetboost_distill = torch.zeros((), device=x.device, dtype=torch.float32)
             booster_scale = getattr(model.module.decoder_fuse, 'last_booster_scale', None)
             if args.subsetboost:
                 subset_indices = mask_to_subset_indices(mask)
